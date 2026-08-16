@@ -50,10 +50,22 @@ tracing-subscriber.workspace = true
 zbus = { workspace = true, features = ["p2p"] }
 zeroize.workspace = true
 zgvariant.workspace = true
+yubikey = { version = "=0.8.0-pre.0", features = ["untested"], optional = true }
+p256 = { version = "0.13", features = ["ecdh"], optional = true }
+aes-gcm = { version = "0.10", optional = true }
+rand = { version = "0.8", optional = true }
 
 [features]
 test-util = ["dep:tempfile"]
-default = ["native_crypto", "kwallet_migration"]
+default = ["native_crypto", "kwallet_migration", "yubikey"]
+yubikey = [
+    "dep:yubikey",
+    "dep:p256",
+    "dep:aes-gcm",
+    "dep:rand",
+    "dep:hkdf",
+    "dep:sha2",
+]
 native_crypto = ["gnome_native_crypto", "plasma_native_crypto"]
 openssl_crypto = ["gnome_openssl_crypto", "plasma_openssl_crypto"]
 kwallet_migration = ["dep:kwallet-parser"]
