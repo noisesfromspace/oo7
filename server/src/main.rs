@@ -15,6 +15,8 @@ mod service;
 mod session;
 #[cfg(test)]
 mod tests;
+#[cfg(feature = "yubikey")]
+mod yubikey;
 
 use std::{
     io::{IoSliceMut, IsTerminal, Read},
@@ -62,6 +64,18 @@ struct Args {
         help = "Print debug information during command processing."
     )]
     is_verbose: bool,
+    #[cfg(feature = "yubikey")]
+    #[arg(
+        long,
+        help = "Unlock the keyring with a YubiKey PIV key (touch required)."
+    )]
+    yubikey: bool,
+    #[cfg(feature = "yubikey")]
+    #[arg(
+        long,
+        help = "Generate a PIV key and wrapped master key on the YubiKey, then exit."
+    )]
+    yubikey_setup: bool,
 }
 
 /// Bounded wait for the transient `oo7-daemon-login` helper to bind its socket.
@@ -164,6 +178,13 @@ async fn read_secret_from_credentials_directory() -> Option<oo7::Secret> {
     }
 }
 
+async fn read_secret_from_pam_or_credentials() -> Option<oo7::Secret> {
+    match read_secret_from_login_helper().await {
+        Some(secret) => Some(secret),
+        None => read_secret_from_credentials_directory().await,
+    }
+}
+
 async fn inner_main(args: Args) -> Result<(), Error> {
     #[cfg(target_os = "linux")]
     capability::drop_unnecessary_capabilities()?;
@@ -187,10 +208,18 @@ async fn inner_main(args: Args) -> Result<(), Error> {
             }
         }
     } else {
-        match read_secret_from_login_helper().await {
-            Some(secret) => Some(secret),
-            None => read_secret_from_credentials_directory().await,
-        }
+        #[cfg(feature = "yubikey")]
+        let s = if args.yubikey {
+            tracing::info!("Unlocking keyring with YubiKey");
+            Some(oo7::Secret::from(yubikey::unlock().map_err(Error::IO)?))
+        } else {
+            read_secret_from_pam_or_credentials().await
+        };
+
+        #[cfg(not(feature = "yubikey"))]
+        let s = read_secret_from_pam_or_credentials().await;
+
+        s
     };
 
     tracing::info!("Starting {BINARY_NAME}");
@@ -232,6 +261,12 @@ async fn main() -> Result<(), Error> {
         tracing::debug!("Running in verbose mode");
     } else {
         tracing_subscriber::fmt::init();
+    }
+
+    #[cfg(feature = "yubikey")]
+    if args.yubikey_setup {
+        yubikey::setup().map_err(Error::IO)?;
+        return Ok(());
     }
 
     inner_main(args).await.inspect_err(|err| {
