@@ -91,6 +91,50 @@ If more output is required, the later can be replaced with:
 /usr/libexec/xdg-desktop-portal --replace --verbose
 ```
 
+## YubiKey unlock
+
+The daemon can unlock the default keyring with a P-256 key held in a YubiKey
+PIV slot instead of the login password. The keyring master key is wrapped with
+the PIV key; unlocking performs ECDH **on the card** (gated behind the key's
+touch policy), so the master key never leaves the YubiKey. This also works for
+auto-login sessions, where no login password is ever entered.
+
+### Setup
+
+1. Generate a PIV key and self-signed certificate in retired slot 82 (P-256,
+   no PIN, touch required for each use):
+
+   ```sh
+   ykman piv keys generate 82 -a eccp256 --touch-policy=always --pin-policy=never /tmp/oo7-82.pub
+   ykman piv certificates generate 82 -s "oo7" /tmp/oo7-82.pub
+   ```
+
+2. Wrap a fresh random master key with the slot's public key and write it to
+   `~/.local/share/oo7/yubikey-master-key.bin`:
+
+   ```sh
+   oo7-daemon --yubikey-setup
+   ```
+
+3. Start the daemon with `--yubikey`. It sends a desktop notification and
+   unlocks once you touch the YubiKey:
+
+   ```sh
+   oo7-daemon --yubikey
+   ```
+
+   To make it persistent, run it as a systemd user service with
+   `ExecStart=…/oo7-daemon --yubikey`.
+
+### Notes
+
+- Building requires pcsc-lite (`pcsclite` + `pkg-config`). The `yubikey` cargo
+  feature (enabled by default) pulls in the YubiKey dependencies.
+- A keyring has a single unlock secret: don't mix `--yubikey` with PAM
+  password unlock.
+- A lost or broken YubiKey means the keyring can't be unlocked — keep a
+  recovery copy of the master key (or a second YubiKey).
+
 ## Translations
 
 Helping to translate oo7 or add support to a new language is very welcome. You

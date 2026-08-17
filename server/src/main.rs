@@ -167,7 +167,7 @@ async fn inner_main(args: Args) -> Result<(), Error> {
         #[cfg(feature = "yubikey")]
         let s = if args.yubikey {
             tracing::info!("Unlocking keyring with YubiKey");
-            Some(oo7::Secret::from(yubikey::unlock().map_err(Error::IO)?))
+            Some(oo7::Secret::from(yubikey::unlock().await.map_err(Error::IO)?))
         } else {
             read_secret_from_pam_or_credentials().await
         };

@@ -150,6 +150,35 @@ fn open_yubikey() -> Result<YubiKey, std::io::Error> {
     })
 }
 
+/// Best-effort desktop notification that the YubiKey is waiting for a touch.
+///
+/// `yubikey-touch-detector` cannot see PIV touches, so the daemon notifies on
+/// its own via the session bus. Errors are ignored (a missing notification
+/// daemon must never prevent unlocking).
+async fn notify_waiting_for_touch() {
+    let Ok(conn) = zbus::Connection::session().await else {
+        return;
+    };
+    let _ = conn
+        .call_method(
+            Some("org.freedesktop.Notifications"),
+            "/org/freedesktop/Notifications",
+            Some("org.freedesktop.Notifications"),
+            "Notify",
+            &(
+                "oo7",
+                0u32,
+                "",
+                "YubiKey",
+                "Touch your YubiKey to unlock the keyring",
+                Vec::<String>::new(),
+                std::collections::HashMap::<String, zbus::zvariant::Value>::new(),
+                -1i32,
+            ),
+        )
+        .await;
+}
+
 /// Wrap a fresh random master key with the P-256 key held in the retired PIV
 /// slot, and write the wrapped key to disk.
 ///
@@ -221,7 +250,7 @@ pub fn setup() -> Result<(), std::io::Error> {
 
 /// Recover the master key via on-card ECDH (touch-gated) and decrypt the
 /// wrapped key.
-pub fn unlock() -> Result<Vec<u8>, std::io::Error> {
+pub async fn unlock() -> Result<Vec<u8>, std::io::Error> {
     let path = wrapped_key_path();
     let wrapped = WrappedKey::read(&path)?;
 
@@ -240,6 +269,7 @@ pub fn unlock() -> Result<Vec<u8>, std::io::Error> {
     // On-card ECDH. This blocks until the user touches the YubiKey (touch
     // policy "always").
     tracing::info!("Waiting for YubiKey touch to unlock keyring...");
+    notify_waiting_for_touch().await;
     let shared = decrypt_data(
         &mut yk,
         epk_uncompressed.as_bytes(),
