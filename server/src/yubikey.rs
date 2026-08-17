@@ -26,9 +26,9 @@ use p256::{
 use rand::{rngs::OsRng, RngCore};
 use sha2::Sha256;
 use yubikey::{
-    certificate::PublicKeyInfo,
-    piv::{decrypt_data, generate, AlgorithmId, RetiredSlotId, SlotId},
-    Context, MgmKey, PinPolicy, TouchPolicy, YubiKey,
+    certificate::{Certificate, PublicKeyInfo},
+    piv::{decrypt_data, AlgorithmId, RetiredSlotId, SlotId},
+    Context, YubiKey,
 };
 use zeroize::Zeroize;
 
@@ -150,41 +150,31 @@ fn open_yubikey() -> Result<YubiKey, std::io::Error> {
     })
 }
 
-/// Generate a P-256 key in the retired PIV slot (if empty), wrap a fresh random
-/// master key with it, and write the wrapped key to disk.
+/// Wrap a fresh random master key with the P-256 key held in the retired PIV
+/// slot, and write the wrapped key to disk.
+///
+/// The PIV key must already exist in the slot (generated with `ykman`, which
+/// handles the management key). We read its public key from the slot's
+/// self-signed certificate, so the management key is never needed here.
 pub fn setup() -> Result<(), std::io::Error> {
     let mut yk = open_yubikey()?;
 
-    // Key generation requires the management key. We only support the factory
-    // default; users with a custom management key should generate the PIV key
-    // with `ykman` instead.
-    yk.authenticate(MgmKey::default()).map_err(|e| {
+    let cert = Certificate::read(&mut yk, SlotId::Retired(SLOT)).map_err(|e| {
         std::io::Error::other(format!(
-            "management key authentication failed: {e} (if you changed the default \
-             management key, generate the key with \
-             `ykman piv keys generate 82 -a ECCP256 --touch-policy=always --pin-policy=never`)"
+            "no key/certificate in slot 82 (RETIRED1): {e}\n\
+             generate one first with:\n  \
+             ykman piv keys generate 82 -a ECCP256 --touch-policy=always --pin-policy=never\n  \
+             ykman piv certificates generate 82 -s \"oo7\""
         ))
     })?;
 
-    let card_point = match generate(
-        &mut yk,
-        SlotId::Retired(SLOT),
-        AlgorithmId::EccP256,
-        PinPolicy::Never,
-        TouchPolicy::Always,
-    ) {
-        Ok(PublicKeyInfo::EcP256(point)) => point,
-        Ok(_) => return Err(std::io::Error::other("generated key is not P-256")),
-        Err(e) => {
-            return Err(std::io::Error::other(format!(
-                "key generation failed: {e} (slot 82 may already be occupied; \
-                 reset it with `ykman piv keys delete 82` and retry)"
-            )))
-        }
+    let card_point = match cert.subject_pki() {
+        PublicKeyInfo::EcP256(point) => point,
+        _ => return Err(std::io::Error::other("key in slot 82 is not P-256")),
     };
 
     let card_pub = PublicKey::from_sec1_bytes(card_point.as_bytes())
-        .map_err(|e| std::io::Error::other(format!("generated an invalid public key: {e}")))?;
+        .map_err(|e| std::io::Error::other(format!("invalid public key in cert: {e}")))?;
     let card_pub_compressed = card_pub.to_encoded_point(true);
 
     // Fresh random master key.
