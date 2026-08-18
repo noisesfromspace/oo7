@@ -72,7 +72,7 @@ struct Args {
     #[cfg(feature = "yubikey")]
     #[arg(
         long,
-        help = "Generate a PIV key and wrapped master key on the YubiKey, then exit."
+        help = "Wrap a fresh master key using the existing YubiKey PIV slot key and certificate, then exit."
     )]
     yubikey_setup: bool,
 }
@@ -184,42 +184,47 @@ async fn read_secret_from_pam_or_credentials() -> Option<oo7::Secret> {
     }
 }
 
+fn read_secret_from_login() -> Result<Option<oo7::Secret>, Error> {
+    let mut stdin = std::io::stdin().lock();
+    if stdin.is_terminal() {
+        let password = rpassword::prompt_password("Enter the login password: ")?;
+        if password.is_empty() {
+            tracing::error!("Login password can't be empty.");
+            return Err(Error::EmptyPassword);
+        }
+        Ok(Some(oo7::Secret::text(password)))
+    } else {
+        let mut buff = vec![];
+        stdin.read_to_end(&mut buff)?;
+        if buff.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(oo7::Secret::from(buff)))
+        }
+    }
+}
+
+async fn read_secret(args: &Args) -> Result<Option<oo7::Secret>, Error> {
+    if args.login {
+        return read_secret_from_login();
+    }
+
+    #[cfg(feature = "yubikey")]
+    if args.yubikey {
+        tracing::info!("Unlocking keyring with YubiKey");
+        return Ok(Some(oo7::Secret::from(
+            yubikey::unlock().await.map_err(Error::IO)?,
+        )));
+    }
+
+    Ok(read_secret_from_pam_or_credentials().await)
+}
+
 async fn inner_main(args: Args) -> Result<(), Error> {
     #[cfg(target_os = "linux")]
     capability::drop_unnecessary_capabilities()?;
 
-    let secret = if args.login {
-        let mut stdin = std::io::stdin().lock();
-        if stdin.is_terminal() {
-            let password = rpassword::prompt_password("Enter the login password: ")?;
-            if password.is_empty() {
-                tracing::error!("Login password can't be empty.");
-                return Err(Error::EmptyPassword);
-            }
-            Some(oo7::Secret::text(password))
-        } else {
-            let mut buff = vec![];
-            stdin.read_to_end(&mut buff)?;
-            if buff.is_empty() {
-                None
-            } else {
-                Some(oo7::Secret::from(buff))
-            }
-        }
-    } else {
-        #[cfg(feature = "yubikey")]
-        let s = if args.yubikey {
-            tracing::info!("Unlocking keyring with YubiKey");
-            Some(oo7::Secret::from(yubikey::unlock().await.map_err(Error::IO)?))
-        } else {
-            read_secret_from_pam_or_credentials().await
-        };
-
-        #[cfg(not(feature = "yubikey"))]
-        let s = read_secret_from_pam_or_credentials().await;
-
-        s
-    };
+    let secret = read_secret(&args).await?;
 
     tracing::info!("Starting {BINARY_NAME}");
 
