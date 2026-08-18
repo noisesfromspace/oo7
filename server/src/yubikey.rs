@@ -11,24 +11,27 @@
 //! so unlocking the keyring requires a physical touch but no PIN — suitable for
 //! headless daemon startup on an auto-login session.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use aes_gcm::{
-    aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
 };
 use hkdf::Hkdf;
-use p256::{
-    ecdh::EphemeralSecret,
-    elliptic_curve::sec1::ToEncodedPoint,
-    PublicKey,
-};
-use rand::{rngs::OsRng, RngCore};
+use p256::{PublicKey, ecdh::EphemeralSecret, elliptic_curve::sec1::ToEncodedPoint};
+use rand::{RngCore, rngs::OsRng};
 use sha2::Sha256;
 use yubikey::{
-    certificate::{Certificate, PublicKeyInfo},
-    piv::{decrypt_data, AlgorithmId, RetiredSlotId, SlotId},
     Context, YubiKey,
+    certificate::{Certificate, PublicKeyInfo},
+    piv::{AlgorithmId, RetiredSlotId, SlotId, decrypt_data},
 };
 use zeroize::Zeroize;
 
@@ -87,7 +90,7 @@ impl WrappedKey {
         let serial = u32::from_le_bytes(
             data[OFF_SERIAL..OFF_CARD_PUB]
                 .try_into()
-                .expect("serial slice is 4 bytes"),
+                .map_err(|_| std::io::Error::other("invalid serial in wrapped key file"))?,
         );
 
         let mut card_pub = [0u8; POINT_LEN];
@@ -109,7 +112,7 @@ impl WrappedKey {
         })
     }
 
-    fn write(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
+    fn write(&self, path: &Path) -> Result<(), std::io::Error> {
         let mut data = Vec::with_capacity(FILE_LEN);
         data.extend_from_slice(MAGIC);
         data.push(self.slot.into());
@@ -118,11 +121,37 @@ impl WrappedKey {
         data.extend_from_slice(&self.epk);
         data.extend_from_slice(&self.nonce);
         data.extend_from_slice(&self.ct);
-        if let Some(parent) = path.parent() {
+
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, &data)
+
+        // Write to a temporary file in the same directory and atomically rename
+        // it into place, so a crash mid-write never leaves a truncated key file.
+        // The file is created 0600 so only the user can read the wrapped key.
+        let tmp = tmp_path_for(path);
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut file = opts.open(&tmp)?;
+        let result = (|| -> std::io::Result<()> {
+            file.write_all(&data)?;
+            file.sync_all()
+        })();
+        drop(file);
+        if let Err(e) = result {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        fs::rename(&tmp, path)
     }
+}
+
+fn tmp_path_for(path: &Path) -> PathBuf {
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(format!(".tmp-{}", std::process::id()));
+    PathBuf::from(tmp)
 }
 
 fn kdf(shared_secret: &[u8], salt: &[u8]) -> Result<[u8; 32], std::io::Error> {
@@ -148,6 +177,20 @@ fn open_yubikey() -> Result<YubiKey, std::io::Error> {
              yubikey-agent may be holding an exclusive connection)"
         ))
     })
+}
+
+/// Verify that the inserted YubiKey is the one that wrapped the key.
+///
+/// Checked before any touch-gated operation so a wrong key fails fast with a
+/// clear message instead of waiting for a touch that can never succeed.
+fn check_serial(wrapped: u32, actual: u32) -> Result<(), std::io::Error> {
+    if wrapped != actual {
+        return Err(std::io::Error::other(format!(
+            "YubiKey serial mismatch: wrapped key expects serial {wrapped}, \
+             inserted key is serial {actual}"
+        )));
+    }
+    Ok(())
 }
 
 /// Best-effort desktop notification that the YubiKey is waiting for a touch.
@@ -233,10 +276,18 @@ pub fn setup() -> Result<(), std::io::Error> {
     let wrapped = WrappedKey {
         slot: SLOT,
         serial: u32::from(yk.serial()),
-        card_pub: card_pub_compressed.as_bytes().try_into().unwrap(),
-        epk: epk_compressed.as_bytes().try_into().unwrap(),
+        card_pub: card_pub_compressed
+            .as_bytes()
+            .try_into()
+            .map_err(|_| std::io::Error::other("card public key is not 33 bytes"))?,
+        epk: epk_compressed
+            .as_bytes()
+            .try_into()
+            .map_err(|_| std::io::Error::other("ephemeral public key is not 33 bytes"))?,
         nonce,
-        ct: ct.try_into().expect("ciphertext is 32 + 16 bytes"),
+        ct: ct
+            .try_into()
+            .map_err(|_| std::io::Error::other("ciphertext is not 48 bytes"))?,
     };
     let path = wrapped_key_path();
     wrapped.write(&path)?;
@@ -255,6 +306,8 @@ pub async fn unlock() -> Result<Vec<u8>, std::io::Error> {
     let wrapped = WrappedKey::read(&path)?;
 
     let mut yk = open_yubikey()?;
+
+    check_serial(wrapped.serial, u32::from(yk.serial()))?;
 
     // Rebuild the salt used at wrap time.
     let mut salt = Vec::with_capacity(POINT_LEN * 2);
@@ -288,8 +341,82 @@ pub async fn unlock() -> Result<Vec<u8>, std::io::Error> {
     kek.zeroize();
 
     if master_key.len() != MASTER_KEY_LEN {
-        return Err(std::io::Error::other("decrypted master key has wrong length"));
+        return Err(std::io::Error::other(
+            "decrypted master key has wrong length",
+        ));
     }
 
     Ok(master_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn sample() -> WrappedKey {
+        WrappedKey {
+            slot: SLOT,
+            serial: 0xDEAD_BEEF,
+            card_pub: [0x11; POINT_LEN],
+            epk: [0x22; POINT_LEN],
+            nonce: [0x33; NONCE_LEN],
+            ct: [0x44; MASTER_KEY_LEN + TAG_LEN],
+        }
+    }
+
+    #[test]
+    fn roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrapped.bin");
+        let wk = sample();
+        wk.write(&path).unwrap();
+        let read = WrappedKey::read(&path).unwrap();
+        assert_eq!(read.slot, wk.slot);
+        assert_eq!(read.serial, wk.serial);
+        assert_eq!(read.card_pub, wk.card_pub);
+        assert_eq!(read.epk, wk.epk);
+        assert_eq!(read.nonce, wk.nonce);
+        assert_eq!(read.ct, wk.ct);
+    }
+
+    #[test]
+    fn invalid_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.bin");
+        std::fs::write(&path, [0u8; 10]).unwrap();
+        let err = WrappedKey::read(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("wrong length"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("badmagic.bin");
+        std::fs::write(&path, vec![0u8; FILE_LEN]).unwrap();
+        let err = WrappedKey::read(&path).unwrap_err();
+        assert!(err.to_string().contains("magic"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn file_is_written_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("perm.bin");
+        sample().write(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn serial_mismatch_is_rejected() {
+        assert!(check_serial(1, 1).is_ok());
+        let err = check_serial(1, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("serial mismatch"),
+            "unexpected error: {err}"
+        );
+    }
 }
