@@ -1,0 +1,11 @@
+{
+    "id": "keyringStatus",
+    "name": "Keyring Status",
+    "description": "Shows whether the secret service keyring is unlocked. Click to restart it (YubiKey touch).",
+    "version": "1.0.0",
+    "author": "Martijn Boers",
+    "type": "widget",
+    "capabilities": ["dankbar-widget"],
+    "component": "./KeyringWidget.qml",
+    "icon": "lock"
+}
