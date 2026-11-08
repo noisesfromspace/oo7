@@ -184,6 +184,14 @@ async fn read_secret_from_pam_or_credentials() -> Option<oo7::Secret> {
     }
 }
 
+#[cfg(feature = "yubikey")]
+async fn read_secret_from_yubikey() -> Result<Option<oo7::Secret>, Error> {
+    tracing::info!("Unlocking keyring with YubiKey");
+    let yubikey = yubikey::unlock().await.map_err(Error::IO)?;
+
+    Ok(Some(oo7::Secret::from(yubikey)))
+}
+
 fn read_secret_from_login() -> Result<Option<oo7::Secret>, Error> {
     let mut stdin = std::io::stdin().lock();
     if stdin.is_terminal() {
@@ -211,10 +219,7 @@ async fn read_secret(args: &Args) -> Result<Option<oo7::Secret>, Error> {
 
     #[cfg(feature = "yubikey")]
     if args.yubikey {
-        tracing::info!("Unlocking keyring with YubiKey");
-        return Ok(Some(oo7::Secret::from(
-            yubikey::unlock().await.map_err(Error::IO)?,
-        )));
+        return read_secret_from_yubikey().await;
     }
 
     Ok(read_secret_from_pam_or_credentials().await)
